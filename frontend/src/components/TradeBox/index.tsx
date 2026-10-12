@@ -126,6 +126,11 @@ const TradeBox = ({ currentOrder }: TradeBoxProps): React.JSX.Element => {
   const { garage } = useContext<UseGarageStoreType>(GarageContext);
   const { settings, navigateToPage, slotUpdatedAt } = useContext<UseAppStoreType>(AppContext);
   const { federation } = useContext<UseFederationStoreType>(FederationContext);
+  // How to reach the order's coordinator, for the dispute texts: its email, else another channel.
+  const coordinatorContact = (() => {
+    const c = federation.getCoordinator(currentOrder.shortAlias ?? '')?.contact;
+    return c?.email || c?.telegram || c?.simplex || c?.nostr || undefined;
+  })();
   const navigate = useNavigate();
 
   // Buttons and Dialogs
@@ -688,13 +693,13 @@ const TradeBox = ({ currentOrder }: TradeBoxProps): React.JSX.Element => {
         if ((status === 17 && isMaker) || (status === 18 && !isMaker)) {
           baseContract.title = 'You have lost the dispute';
           baseContract.prompt = function () {
-            return <DisputeLoserPrompt />;
+            return <DisputeLoserPrompt contact={coordinatorContact} />;
           };
           baseContract.bondStatus = 'settled';
         } else if ((status === 17 && !isMaker) || (status === 18 && isMaker)) {
           baseContract.title = 'You have won the dispute';
           baseContract.prompt = function () {
-            return <DisputeWinnerPrompt />;
+            return <DisputeWinnerPrompt contact={coordinatorContact} />;
           };
         }
         break;
