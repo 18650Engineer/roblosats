@@ -72,8 +72,7 @@ class LNDNode:
     # Leave unset to use gRPC's default hostname verification.
     tls_server_name = config("LND_TLS_SERVER_NAME", default="").strip()
     channel_options = (
-        [("grpc.ssl_target_name_override", tls_server_name)]
-        if tls_server_name else []
+        [("grpc.ssl_target_name_override", tls_server_name)] if tls_server_name else []
     )
     channel = grpc.secure_channel(
         LND_GRPC_HOST, combined_creds, options=channel_options

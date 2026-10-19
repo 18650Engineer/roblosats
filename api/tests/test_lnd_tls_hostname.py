@@ -2,19 +2,13 @@
 
 import importlib.util
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
 from unittest import TestCase
+from unittest.mock import MagicMock, patch
 
 
 class LNDTLSHostnameTests(TestCase):
-
     def check_hostname(self, hostname, expected_options):
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "lightning"
-            / "lnd.py"
-        )
+        source = Path(__file__).resolve().parents[1] / "lightning" / "lnd.py"
 
         config_values = {
             "LND_DIR": "/nonexistent-lnd-test-directory",
@@ -33,22 +27,28 @@ class LNDTLSHostnameTests(TestCase):
         )
         module = importlib.util.module_from_spec(spec)
 
-        with patch(
-            "decouple.config",
-            side_effect=fake_config,
-        ), patch(
-            "grpc.ssl_channel_credentials",
-            return_value=MagicMock(),
-        ), patch(
-            "grpc.metadata_call_credentials",
-            return_value=MagicMock(),
-        ), patch(
-            "grpc.composite_channel_credentials",
-            return_value=MagicMock(),
-        ), patch(
-            "grpc.secure_channel",
-            return_value=MagicMock(),
-        ) as mock_channel:
+        with (
+            patch(
+                "decouple.config",
+                side_effect=fake_config,
+            ),
+            patch(
+                "grpc.ssl_channel_credentials",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "grpc.metadata_call_credentials",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "grpc.composite_channel_credentials",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "grpc.secure_channel",
+                return_value=MagicMock(),
+            ) as mock_channel,
+        ):
             spec.loader.exec_module(module)
 
         self.assertEqual(
