@@ -18,10 +18,16 @@ from decouple import config
 from django.conf import settings
 from django.contrib import admin
 from django.urls import include, path
+from roblosats_admin.views import set_admin_language
 
 VERSION = settings.VERSION
 
 urlpatterns = [
+    path(
+        "coordinator/set-language/",
+        set_admin_language,
+        name="roblosats_admin_set_language",
+    ),
     path("coordinator/", admin.site.urls),
     path("api/", include("api.urls")),
     # path('chat/', include('chat.urls')),

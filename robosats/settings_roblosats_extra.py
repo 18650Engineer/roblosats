@@ -56,6 +56,10 @@ def roblosats_dashboard(request, context=None):
     from django.utils import timezone
 
     from api.models import Order
+    from roblosats_admin.language import get_language, translate, format_remaining, format_expired
+
+    language = get_language(request)
+    t = lambda text: translate(text, language)
 
     ahora = timezone.now()
 
@@ -73,7 +77,7 @@ def roblosats_dashboard(request, context=None):
             return "", False
         segundos = int((limite - ahora).total_seconds())
         if segundos <= 0:
-            return "Expired", True
+            return t("Expired"), True
         minutos, _ = divmod(segundos, 60)
         horas, minutos = divmod(minutos, 60)
         dias, horas = divmod(horas, 24)
@@ -83,7 +87,7 @@ def roblosats_dashboard(request, context=None):
             resto = f"{horas} h {minutos} min"
         else:
             resto = f"{minutos} min"
-        return f"{resto} remaining", segundos < 1800
+        return format_remaining(resto, language), segundos < 1800
 
     def url_orden(pk):
         return reverse("admin:api_order_change", args=[pk])
@@ -104,9 +108,9 @@ def roblosats_dashboard(request, context=None):
         ordenes_vivas.append(
             {
                 "id": o.id,
-                "tipo": o.get_type_display(),
+                "tipo": t(o.get_type_display()),
                 "importe": f"{o.amount or o.max_amount or '?'} {o.currency}",
-                "estado": o.get_status_display(),
+                "estado": t(o.get_status_display()),
                 "desde": hora(o.created_at),
                 "hasta": hora(o.expires_at),
                 "queda": queda,
@@ -141,42 +145,42 @@ def roblosats_dashboard(request, context=None):
         "enlaces": {"disputas": lista(status__exact=11)},
         "tarjetas": [
             {
-                "titulo": "Active",
+                "titulo": t("Active"),
                 "valor": en_curso,
                 "link": lista(status__in="6%2C7%2C8%2C9%2C10"),
-                "pie": "Collateral, chat, or fiat sent",
+                "pie": t("Collateral, chat, or fiat sent"),
             },
             {
-                "titulo": "Order Book",
+                "titulo": t("Order Book"),
                 "valor": publicas,
                 "link": lista(status__exact=1),
-                "pie": "Waiting for takers",
+                "pie": t("Waiting for takers"),
             },
             {
-                "titulo": "Disputes",
+                "titulo": t("Disputes"),
                 "valor": disputas + esperando,
                 "link": lista(status__exact=11),
-                "pie": "Open and awaiting resolution",
+                "pie": t("Open and awaiting resolution"),
             },
             {
-                "titulo": "Completed",
+                "titulo": t("Completed"),
                 "valor": completadas,
                 "link": lista(status__exact=14),
-                "pie": "History",
+                "pie": t("History"),
             },
             {
-                "titulo": "Canceled",
+                "titulo": t("Canceled"),
                 "valor": canceladas,
                 "link": lista(status__in="4%2C12"),
-                "pie": f"Canceled or mutually canceled · {expiradas} expired",
+                "pie": format_expired(expiradas, language),
             },
         ],
         "ordenes_vivas": ordenes_vivas,
         "accesos": [
-            {"titulo": "All Orders", "link": f"{ADMIN_ROOT}api/order/"},
+            {"titulo": t("All Orders"), "link": f"{ADMIN_ROOT}api/order/"},
             {"titulo": "Robots", "link": f"{ADMIN_ROOT}api/robot/"},
-            {"titulo": "Lightning Payments", "link": f"{ADMIN_ROOT}api/lnpayment/"},
-            {"titulo": "On-chain Payments", "link": f"{ADMIN_ROOT}api/onchainpayment/"},
+            {"titulo": t("Lightning Payments"), "link": f"{ADMIN_ROOT}api/lnpayment/"},
+            {"titulo": t("On-chain Payments"), "link": f"{ADMIN_ROOT}api/onchainpayment/"},
         ],
         "coordinador": {
             "alias": config("COORDINATOR_ALIAS", cast=str, default="Roblosats"),
@@ -197,11 +201,19 @@ def roblosats_dashboard(request, context=None):
 UNFOLD = {
     "SITE_TITLE": f"{config('COORDINATOR_ALIAS', cast=str, default='Roblosats')} Admin",
     "SITE_HEADER": config("COORDINATOR_ALIAS", cast=str, default="Roblosats"),
-    "SITE_SUBHEADER": "Coordinator Dashboard",
+    "SITE_SUBHEADER": "roblosats_admin.language.coordinator_subheader",
     "SITE_SYMBOL": "local_fire_department",
     "DASHBOARD_CALLBACK": "robosats.settings.roblosats_dashboard",
     "SHOW_HISTORY": True,
     "SHOW_VIEW_ON_SITE": True,
+    "SHOW_LANGUAGES": True,
+    "LANGUAGES": {
+        "action": "/coordinator/set-language/",
+        "navigation": [
+            {"code": "es", "name_local": "Español"},
+            {"code": "en", "name_local": "English"},
+        ],
+    },
     "THEME": None,
     "COLORS": {
         "primary": {
@@ -221,7 +233,11 @@ UNFOLD = {
     "SIDEBAR": {
         "show_search": True,
         "show_all_applications": True,
-        "navigation": [
+        "navigation": "roblosats_admin.language.translate_navigation",
+    },
+}
+
+ROBLOSATS_ADMIN_NAVIGATION = [
             {
                 "title": "Coordinator",
                 "separator": True,
@@ -326,6 +342,11 @@ UNFOLD = {
                     },
                 ],
             },
-        ],
-    },
-}
+        ]
+
+# Apply language preferences only to the coordinator administration.
+MIDDLEWARE = list(MIDDLEWARE)
+MIDDLEWARE.insert(
+    MIDDLEWARE.index("django.contrib.auth.middleware.AuthenticationMiddleware") + 1,
+    "roblosats_admin.middleware.CoordinatorLanguageMiddleware",
+)
