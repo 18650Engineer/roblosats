@@ -1805,6 +1805,11 @@ class Logics:
 
     def return_escrow(order):
         """returns the trade escrow"""
+        # No escrow invoice yet (maker cancels in WF2 before it is generated): nothing to
+        # return. Without this the cancel raised after settling the bonds, leaving the
+        # order stuck and the taker unrewarded.
+        if order.trade_escrow is None:
+            return False
         if LNNode.cancel_return_hold_invoice(order.trade_escrow.payment_hash):
             order.trade_escrow.status = LNPayment.Status.RETNED
             order.trade_escrow.save(update_fields=["status"])
@@ -1814,6 +1819,8 @@ class Logics:
     def cancel_escrow(order):
         """returns the trade escrow"""
         # Same as return escrow, but used when the invoice was never LOCKED
+        if order.trade_escrow is None:
+            return False
         if LNNode.cancel_return_hold_invoice(order.trade_escrow.payment_hash):
             order.trade_escrow.status = LNPayment.Status.CANCEL
             order.trade_escrow.save(update_fields=["status"])
