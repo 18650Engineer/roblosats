@@ -226,6 +226,114 @@ def neoxa_rates(session, api_url, currencies):
 
 
 
+def nonkyc_rates(session, api_url, currencies):
+    """
+    Roblosats: the price of BTCB2 from NonKYC (22 oct 2026, after an audit found that a
+    single last-trade price from one exchange could be moved with one small trade).
+    [api_url] is NonKYC's BTCB2_USDT ticker (api.nonkyc.io/api/v2/ticker/BTCB2_USDT), or
+    a proxy ending in /nonkyc-ticker (mempool.kilombino.com has one: NonKYC blocks Tor
+    exits); the BTC pair is the same URL with BTCB2_BTC, or /nonkyc-ticker-btc.
+
+    Every quote is the MIDPOINT of the order book (bid/ask), never the last trade, and only
+    if the spread is sane (BTCB2_MAX_SPREAD). NonKYC is one venue (the mean of its BTCB2/USDT
+    and BTCB2/BTC x BTC/USD books); Neoxa (NEOXA_TICKER_URL) is the other. The price is the
+    mean of the venues; if they disagree by more than BTCB2_MAX_VENUE_DEVIATION, the one
+    closer to the last stored price wins. It never moves more than BTCB2_MAX_STEP from the
+    last stored price per refresh. Other fiat currencies are
+    that USD price times yadio's USD rate for them, as before.
+    """
+    max_spread = config("BTCB2_MAX_SPREAD", cast=float, default=0.05)
+
+    def mid(bid, ask):
+        bid, ask = float(bid), float(ask)
+        if not (bid > 0 and ask > 0 and ask >= bid):
+            return None
+        m = (bid + ask) / 2
+        return m if (ask - bid) / m <= max_spread else None
+
+    fx_all = {}
+    try:
+        fx_all = session.get(
+            config("FX_RATES_API", cast=str, default="https://api.yadio.io/exrates/USD")
+        ).json()
+    except Exception as e:
+        print(f"Could not fetch USD exchange rates: {str(e)}")
+    fx = fx_all.get("USD", {})
+    btc_usd = fx_all.get("BTC")
+
+    nonkyc = []  # NonKYC's two books are one venue
+    neoxa = None
+    btc = np.nan
+    try:
+        t = session.get(api_url).json()
+        q = mid(t["bid"], t["ask"])
+        if q:
+            nonkyc.append(q)
+    except Exception as e:
+        print(f"NonKYC BTCB2_USDT unavailable: {str(e)}")
+    try:
+        t = session.get(
+            api_url.replace("BTCB2_USDT", "BTCB2_BTC")
+            if "BTCB2_USDT" in api_url
+            else api_url + "-btc"
+        ).json()
+        q = mid(t["bid"], t["ask"])
+        if q:
+            btc = q
+            if btc_usd:
+                nonkyc.append(q * float(btc_usd))
+    except Exception as e:
+        print(f"NonKYC BTCB2_BTC unavailable: {str(e)}")
+    neoxa_url = config("NEOXA_TICKER_URL", cast=str, default="")
+    if neoxa_url:
+        try:
+            t = session.get(neoxa_url).json()["ticker"]
+            neoxa = mid(t["bestBid"], t["bestAsk"])
+        except Exception as e:
+            print(f"Neoxa unavailable: {str(e)}")
+
+    venues = ([float(np.mean(nonkyc))] if nonkyc else []) + ([neoxa] if neoxa else [])
+    last = None
+    try:
+        from api.models import Currency
+
+        last = float(Currency.objects.get(currency=Currency.currency_dict["USD"]).exchange_rate)
+    except Exception:
+        pass
+    if venues:
+        usd = float(np.mean(venues))
+        if len(venues) == 2:
+            a, b = venues
+            if abs(a - b) / min(a, b) > config("BTCB2_MAX_VENUE_DEVIATION", cast=float, default=0.10):
+                # The venues disagree: one of them is off (thin book, manipulation).
+                # Keep the one closer to the price we already had.
+                usd = min(venues, key=lambda v: abs(v - last)) if last else min(venues)
+                print(f"BTCB2 venues disagree (NonKYC {a:.2f}, Neoxa {b:.2f}); using {usd:.2f}")
+        # And never move more than BTCB2_MAX_STEP per refresh: a real move gets there in a
+        # few minutes, a one-off spike or a thin-book trick doesn't.
+        step = config("BTCB2_MAX_STEP", cast=float, default=0.05)
+        if last and last > 0:
+            usd = min(max(usd, last * (1 - step)), last * (1 + step))
+    else:
+        usd = config("BTCB2_FALLBACK_USD", cast=float, default=0.0)
+        if not usd > 0:
+            raise Exception("no BTCB2 price from NonKYC or Neoxa")
+        print(f"No BTCB2 quote; using BTCB2_FALLBACK_USD={usd}")
+
+    rates = []
+    for currency in currencies:
+        if currency == "USD":
+            rates.append(usd)
+        elif currency == "BTC":
+            rates.append(btc)
+        else:
+            try:
+                rates.append(usd * float(fx[currency]))
+            except Exception:
+                rates.append(np.nan)
+    return rates
+
+
 @ring.dict(market_cache, expire=30)  # keeps in cache for 30 seconds
 def get_exchange_rates(currencies):
     """
@@ -243,6 +351,9 @@ def get_exchange_rates(currencies):
         try:  # If one API is unavailable pass
             if "neoxa" in api_url:
                 api_rates.append(neoxa_rates(session, api_url, currencies))
+
+            elif "nonkyc" in api_url:
+                api_rates.append(nonkyc_rates(session, api_url, currencies))
 
             elif "blockchain.info" in api_url:
                 blockchain_prices = session.get(api_url).json()
