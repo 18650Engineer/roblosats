@@ -153,22 +153,40 @@ def ledger_backed(robot_id):
     return int(now), int(waiting)
 
 
-def ledger_withdrawn_24h(robot_id):
+def ledger_withdrawn_24h(robot_id=None):
+    """Net sats withdrawn in the last 24 h by one robot, or by all of them (None)."""
     ensure_ledger()
     with connection.cursor() as c:
         c.execute(
             f"""SELECT COALESCE(-SUM(amount), 0) FROM {LEDGER_TABLE}
-                WHERE robot_id = %s AND kind IN ('withdraw', 'withdraw_refund')
+                WHERE (%s IS NULL OR robot_id = %s)
+                AND kind IN ('withdraw', 'withdraw_refund')
                 AND created_at > now() - interval '24 hours'""",
-            [robot_id],
+            [robot_id, robot_id],
         )
         return int(c.fetchone()[0])
 
 
+def ledger_last_withdrawal(robot_id):
+    """When the robot last withdrew (a withdrawal later refunded does not count)."""
+    ensure_ledger()
+    with connection.cursor() as c:
+        c.execute(
+            f"""SELECT MAX(w.created_at) FROM {LEDGER_TABLE} w
+                WHERE w.robot_id = %s AND w.kind = 'withdraw'
+                AND NOT EXISTS (SELECT 1 FROM {LEDGER_TABLE} r
+                    WHERE r.fingerprint = 'withdraw_refund:' || substr(w.fingerprint, 10))""",
+            [robot_id],
+        )
+        return c.fetchone()[0]
+
+
 def withdrawable_rewards(robot):
     """What a robot can withdraw now: its balance, capped by the ledger (only rows
-    already available) and by REWARD_WITHDRAW_DAILY_MAX. Also shown in the app, so
-    the invoice the user makes matches what will be paid."""
+    already available), by REWARD_WITHDRAW_DAILY_MAX, by REWARD_WITHDRAW_GLOBAL_DAILY_MAX
+    (all robots together) and nothing during REWARD_WITHDRAW_COOLDOWN seconds after its
+    last withdrawal. Also shown in the app, so the invoice the user makes matches what
+    will be paid."""
     backed, waiting = ledger_backed(robot.pk)
     sats = min(robot.earned_rewards, backed)
     if robot.earned_rewards > backed + waiting:
@@ -180,7 +198,44 @@ def withdrawable_rewards(robot):
     daily_max = config("REWARD_WITHDRAW_DAILY_MAX", cast=int, default=0)
     if daily_max:
         sats = min(sats, daily_max - ledger_withdrawn_24h(robot.pk))
+    # A circuit breaker for bugs nobody knows of yet: whatever inflates balances,
+    # no more than this leaves the coordinator as rewards in a day.
+    global_max = config("REWARD_WITHDRAW_GLOBAL_DAILY_MAX", cast=int, default=0)
+    if global_max:
+        sats = min(sats, global_max - ledger_withdrawn_24h())
+    cooldown = config("REWARD_WITHDRAW_COOLDOWN", cast=int, default=0)
+    if cooldown:
+        last = ledger_last_withdrawal(robot.pk)
+        if last and timezone.now() - last < timedelta(seconds=cooldown):
+            sats = 0
     return max(int(sats), 0)
+
+
+def payout_problem(lnpayment):
+    """Why a buyer payout must not be sent now, or None. Checked right before every
+    attempt, against LND and not only the database: the escrow that backs it must be
+    settled in LND and cover it, and PAYOUT_MAX_SATS (if set) caps a single payout."""
+    if lnpayment.concept != LNPayment.Concepts.PAYBUYER:
+        return "not a buyer payout"
+    order = Order.objects.filter(payout=lnpayment).first()
+    if order is None:
+        return "no order has this payout"
+    if order.status not in (Order.Status.PAY, Order.Status.FAI):
+        return f"order status is {order.get_status_display()}"
+    escrow = order.trade_escrow
+    if escrow is None or escrow.status != LNPayment.Status.SETLED:
+        return "the trade escrow is not settled"
+    if escrow.num_satoshis < lnpayment.num_satoshis:
+        return f"payout {lnpayment.num_satoshis} > escrow {escrow.num_satoshis}"
+    cap = config("PAYOUT_MAX_SATS", cast=int, default=0)
+    if cap and lnpayment.num_satoshis > cap:
+        return f"payout {lnpayment.num_satoshis} is over PAYOUT_MAX_SATS ({cap})"
+    try:
+        if not LNNode.double_check_htlc_is_settled(escrow.payment_hash):
+            return "LND does not show the trade escrow as settled"
+    except Exception as e:
+        return f"could not check the escrow in LND ({e})"
+    return None
 
 
 class Logics:
@@ -1972,6 +2027,43 @@ class Logics:
         return True, None
 
     @classmethod
+    def reward_source_problem(cls, order, slashed_bond, staked_bond, reward):
+        """Why a slashed bond must not be rewarded, or None: one bond is this order's
+        maker bond and the other a taker bond of another robot (the taker's link is
+        already cleared when the order goes back to the book, so it can't be required),
+        the slashed bond was never rewarded under another order, it is settled in the
+        database AND in LND (the sats really are the coordinator's), and the reward is
+        not larger than the smaller bond."""
+        pair = {slashed_bond.pk, staked_bond.pk}
+        if order.maker_bond_id not in pair or len(pair) != 2:
+            return "the bonds are not this order's maker bond and a taker bond"
+        other = staked_bond if slashed_bond.pk == order.maker_bond_id else slashed_bond
+        if other.concept != LNPayment.Concepts.TAKEBOND:
+            return "the other bond is not a taker bond"
+        if slashed_bond.sender_id == staked_bond.sender_id:
+            return "slashed and staked bond are the same robot's"
+        ensure_ledger()
+        with connection.cursor() as c:
+            c.execute(
+                f"SELECT 1 FROM {LEDGER_TABLE} WHERE kind = 'slash_reward' "
+                "AND fingerprint LIKE %s AND order_id <> %s LIMIT 1",
+                [f"slash_reward:%:{slashed_bond.payment_hash}", order.id],
+            )
+            if c.fetchone():
+                return "the slashed bond was already rewarded in another order"
+        slashed_bond.refresh_from_db(fields=["status"])
+        if slashed_bond.status != LNPayment.Status.SETLED:
+            return "the slashed bond is not settled"
+        if reward < 0 or reward > min(slashed_bond.num_satoshis, staked_bond.num_satoshis):
+            return f"reward {reward} is larger than the smaller bond"
+        try:
+            if not LNNode.double_check_htlc_is_settled(slashed_bond.payment_hash):
+                return "LND does not show the slashed bond as settled"
+        except Exception as e:
+            return f"could not check the slashed bond in LND ({e})"
+        return None
+
+    @classmethod
     def add_slashed_rewards(cls, order, slashed_bond, staked_bond):
         """
         When a bond is slashed due to overtime, rewards the user that was waiting.
@@ -1995,6 +2087,13 @@ class Logics:
 
         reward = int(slashed_satoshis * reward_fraction)
         rewarded_robot = staked_bond.sender.robot
+        problem = cls.reward_source_problem(order, slashed_bond, staked_bond, reward)
+        if problem:
+            order.log(
+                f"Reward for slashed bond {slashed_bond.payment_hash} NOT CREDITED: {problem}",
+                level="WARN",
+            )
+            return
         # One credit per slashed bond, enforced by the ledger's unique fingerprint: a
         # second call for the same bond (concurrent cancels, retries) credits nothing,
         # and neither proceeds nor the devfund donation are counted again.
