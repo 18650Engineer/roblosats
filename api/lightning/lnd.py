@@ -392,10 +392,23 @@ class LNDNode:
                             f"than invoice value {expected_msat} msat. "
                             f"Cancelling invoice immediately."
                         )
-                        cls.cancel_return_hold_invoice(lnpayment.payment_hash)
+                        # CANCEL first: if the cancel itself fails, the invoice must
+                        # still not count as locked (it is retried on the next lookup).
                         status = LNPayment.Status.CANCEL
-                except Exception:
-                    pass
+                        try:
+                            cls.cancel_return_hold_invoice(lnpayment.payment_hash)
+                        except Exception as e:
+                            print(
+                                f"ERROR: could not cancel hold invoice "
+                                f"{lnpayment.payment_hash}: {e}"
+                            )
+                except Exception as e:
+                    # Could not verify the locked amount: don't advance the trade on it.
+                    print(
+                        f"ERROR: could not check the locked amount of hold invoice "
+                        f"{lnpayment.payment_hash}: {e}"
+                    )
+                    status = lnpayment.status
 
         except Exception as e:
             # If it fails at finding the invoice: it has been canceled.

@@ -17,9 +17,33 @@ PGP chat, Tor), running on that chain's own Lightning network.
 All changes live on the `roblosats` branch as a small set of commits on top of an upstream
 release tag, so each new RoboSats release can be taken by rebasing that branch.
 
-- **Prices** (`api/utils.py`): BTCB2 from Neoxa (the exchange where it trades), in USD; every
-  other fiat currency is that price times yadio's USD rate. Set
-  `MARKET_PRICE_APIS=https://mempool.kilombino.com/neoxa-ticker` (a proxy that works over Tor).
+- **Prices** (`api/utils.py`, `nonkyc_rates`): BTCB2 in USD from two venues, NonKYC (its
+  BTCB2/USDT and BTCB2/BTC x BTC/USD books count as one venue) and Neoxa. Every quote is the
+  order-book midpoint with a spread of at most 5 % (`BTCB2_MAX_SPREAD`), never the last trade.
+  The price is the mean of the two venues; with fewer than `BTCB2_MIN_VENUES` (2) answering,
+  or if they differ by more than `BTCB2_MAX_VENUE_DEVIATION` (10 %), the last stored price is
+  kept; it never moves more than `BTCB2_MAX_STEP` (5 %) per refresh. Every other fiat currency
+  is that price times yadio's USD rate. Set
+
+  ```
+  MARKET_PRICE_APIS = 'https://mempool.kilombino.com/nonkyc-ticker'
+  NEOXA_TICKER_URL  = 'https://mempool.kilombino.com/neoxa-ticker'
+  ```
+
+  Those two are proxies on the Roblosats maintainer's mempool server, because NonKYC and
+  Neoxa block Tor exits: using them means trusting that server with your price. A
+  coordinator with clearnet access can point straight at the venues instead:
+
+  ```
+  MARKET_PRICE_APIS = 'https://api.nonkyc.io/api/v2/ticker/BTCB2_USDT'
+  NEOXA_TICKER_URL  = 'https://neoxa.exchange/api/exchange/ticker/BTCB2_USDC'
+  ```
+
+  `MARKET_PRICE_APIS` pointing at Neoxa alone (the setting before 22 oct 2026) still works,
+  but it is a single venue: switch to the two above.
+- **PostgreSQL only**: order actions are serialized with PostgreSQL advisory locks and the
+  reward ledger uses PostgreSQL triggers; the coordinator refuses to run order actions on
+  any other database.
 - **Fee rates** for on-chain payouts come from the chain's own mempool (`MEMPOOL_FEES_URL`,
   default https://mempool.kilombino.com), not mempool.space.
 - **No devfund keysend** when `DEVFUND=0` (RoboSats' devfund node is not on this Lightning network).

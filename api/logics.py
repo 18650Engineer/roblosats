@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 
 from decouple import config, Csv
+from django.core.exceptions import ImproperlyConfigured
 from django.contrib.auth.models import User
 from django.db.models import F, Q, Sum
 from django.utils import timezone
@@ -53,6 +54,10 @@ def order_lock(order_id, space=7391):
     payment already sent can never be rolled back in the database by an error
     later in the same request. Re-entrant within one connection, and released
     by PostgreSQL if the process dies. space=7392 is used for robots."""
+    if connection.vendor != "postgresql":
+        # Advisory locks are PostgreSQL-only; without them every order action would run
+        # unserialized. Refuse loudly rather than run unprotected (e.g. on sqlite).
+        raise ImproperlyConfigured("order_lock needs PostgreSQL (pg_advisory_lock)")
     with connection.cursor() as c:
         c.execute("SELECT pg_advisory_lock(%s, %s)", [space, int(order_id)])
     try:

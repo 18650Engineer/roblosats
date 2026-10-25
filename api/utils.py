@@ -179,10 +179,19 @@ def neoxa_rates(session, api_url, currencies):
     reachable over Tor, where Neoxa's own site is not); the BTC pair is the same URL with
     BTCB2_BTC, or /neoxa-ticker-btc.
     """
+    # Single venue, kept for coordinators configured before nonkyc_rates (22 oct 2026):
+    # prefer MARKET_PRICE_APIS=<nonkyc ticker> + NEOXA_TICKER_URL. At least the quote is
+    # the order-book midpoint with a sane spread, not the last trade (one small trade
+    # moves that).
+    print("MARKET_PRICE_APIS points at Neoxa alone: one venue; see nonkyc_rates")
     try:
-        usd = float(session.get(api_url).json()["ticker"]["lastPrice"])
-        if not usd > 0:
-            raise Exception("no BTCB2 price from Neoxa")
+        t = session.get(api_url).json()["ticker"]
+        bid, ask = float(t["bestBid"]), float(t["bestAsk"])
+        usd = (bid + ask) / 2
+        if not (bid > 0 and ask >= bid) or (ask - bid) / usd > config(
+            "BTCB2_MAX_SPREAD", cast=float, default=0.05
+        ):
+            raise Exception(f"Neoxa book unusable (bid {bid}, ask {ask})")
     except Exception as e:
         # If Neoxa is gone, the coordinator's own price (BTCB2_FALLBACK_USD) keeps the book
         # priced; users can always set explicit sats amounts too.
@@ -200,15 +209,14 @@ def neoxa_rates(session, api_url, currencies):
     btc = np.nan
     if "BTC" in currencies:
         try:
-            btc = float(
-                session.get(
-                    api_url.replace("BTCB2_USDC", "BTCB2_BTC")
-                    if "BTCB2_USDC" in api_url
-                    else api_url + "-btc"
-                ).json()[
-                    "ticker"
-                ]["lastPrice"]
-            )
+            t = session.get(
+                api_url.replace("BTCB2_USDC", "BTCB2_BTC")
+                if "BTCB2_USDC" in api_url
+                else api_url + "-btc"
+            ).json()["ticker"]
+            bid, ask = float(t["bestBid"]), float(t["bestAsk"])
+            if bid > 0 and ask >= bid:
+                btc = (bid + ask) / 2
         except Exception:
             pass
     rates = []
@@ -239,8 +247,14 @@ def nonkyc_rates(session, api_url, currencies):
     and BTCB2/BTC x BTC/USD books); Neoxa (NEOXA_TICKER_URL) is the other. The price is the
     mean of the venues; if they disagree by more than BTCB2_MAX_VENUE_DEVIATION, the one
     closer to the last stored price wins. It never moves more than BTCB2_MAX_STEP from the
-    last stored price per refresh. Other fiat currencies are
+    last stored price per refresh. With fewer than BTCB2_MIN_VENUES (2) venues answering,
+    the last stored price is kept. Other fiat currencies are
     that USD price times yadio's USD rate for them, as before.
+
+    Trust: the default proxies (mempool.kilombino.com) are run by Roblosats' maintainer.
+    A coordinator with clearnet access can point straight at the venues instead
+    (MARKET_PRICE_APIS=https://api.nonkyc.io/api/v2/ticker/BTCB2_USDT,
+    NEOXA_TICKER_URL=https://neoxa.exchange/api/exchange/ticker/BTCB2_USDC).
     """
     max_spread = config("BTCB2_MAX_SPREAD", cast=float, default=0.05)
 
@@ -297,17 +311,36 @@ def nonkyc_rates(session, api_url, currencies):
     try:
         from api.models import Currency
 
-        last = float(Currency.objects.get(currency=Currency.currency_dict["USD"]).exchange_rate)
-    except Exception:
-        pass
-    if venues:
+        # currency_dict maps code -> label ({"1": "USD", ...}): look the code up by label.
+        # (rl9-rl11 indexed it by "USD", a KeyError swallowed here, so `last` was always
+        # None and neither BTCB2_MAX_STEP nor the closer-venue rule ever applied.)
+        usd_code = next(int(k) for k, v in Currency.currency_dict.items() if v == "USD")
+        last = float(Currency.objects.get(currency=usd_code).exchange_rate)
+    except Exception as e:
+        print(f"No stored BTCB2 USD price to compare with: {str(e)}")
+    # With fewer than BTCB2_MIN_VENUES distinct venues answering, one venue alone could
+    # walk the price (BTCB2_MAX_STEP per refresh, again and again): keep the last stored
+    # price instead. Only when there is none yet (first start) is one venue enough.
+    min_venues = config("BTCB2_MIN_VENUES", cast=int, default=2)
+    if venues and len(venues) < min_venues and last and last > 0:
+        print(
+            f"Only {len(venues)} BTCB2 venue(s) answered (BTCB2_MIN_VENUES={min_venues}); "
+            f"keeping the last price {last:.2f}"
+        )
+        venues = []
+        usd = last
+    elif venues:
         usd = float(np.mean(venues))
         if len(venues) == 2:
             a, b = venues
             if abs(a - b) / min(a, b) > config("BTCB2_MAX_VENUE_DEVIATION", cast=float, default=0.10):
                 # The venues disagree: one of them is off (thin book, manipulation).
-                # Keep the one closer to the price we already had.
-                usd = min(venues, key=lambda v: abs(v - last)) if last else min(venues)
+                # Then they are not two agreeing venues: keep the last stored price
+                # if BTCB2_MIN_VENUES asks for two, else the venue closer to it.
+                if min_venues >= 2 and last and last > 0:
+                    usd = last
+                else:
+                    usd = min(venues, key=lambda v: abs(v - last)) if last else min(venues)
                 print(f"BTCB2 venues disagree (NonKYC {a:.2f}, Neoxa {b:.2f}); using {usd:.2f}")
         # And never move more than BTCB2_MAX_STEP per refresh: a real move gets there in a
         # few minutes, a one-off spike or a thin-book trick doesn't.
