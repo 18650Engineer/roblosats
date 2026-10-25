@@ -2,8 +2,10 @@
 Roblosats rl12: follow-ups from the external review of the order-lock / payout hardening.
 
 - BTCB2 price oracle: the last stored USD price is really read (it was always None, so
-  BTCB2_MAX_STEP never applied); fewer than BTCB2_MIN_VENUES distinct venues (or two that disagree)
-  keep the last stored price; the legacy Neoxa-only path uses the book midpoint.
+  BTCB2_MAX_STEP never applied); fewer than BTCB2_MIN_VENUES distinct venues (or two that
+  disagree) keep the last stored price for BTCB2_SINGLE_VENUE_GRACE seconds from the last
+  refresh with quorum, then follow the closest venue capped by BTCB2_MAX_STEP; the legacy
+  Neoxa-only path uses the book midpoint.
 - LND hold-invoice amount check: an under-paid invoice is never reported LOCKED, even
   if cancelling it fails.
 - order_lock refuses to run without PostgreSQL.
@@ -14,11 +16,12 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from decouple import config as real_config
+from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.test import TestCase
 
 from api.models import Currency, LNPayment
-from api.utils import neoxa_rates, nonkyc_rates
+from api.utils import BTCB2_QUORUM_KEY, neoxa_rates, nonkyc_rates
 
 NONKYC = "https://api.nonkyc.io/api/v2/ticker/BTCB2_USDT"
 NONKYC_BTC = "https://api.nonkyc.io/api/v2/ticker/BTCB2_BTC"
@@ -66,6 +69,10 @@ YADIO_ANSWER = {"USD": {"EUR": 0.9}, "BTC": 100000.0}
 class NonkycRatesTest(TestCase):
     def setUp(self):
         self.usd = next(int(k) for k, v in Currency.currency_dict.items() if v == "USD")
+        cache.delete(BTCB2_QUORUM_KEY)
+
+    def tearDown(self):
+        cache.delete(BTCB2_QUORUM_KEY)
 
     def store_last(self, price):
         Currency.objects.update_or_create(
@@ -148,6 +155,105 @@ class NonkycRatesTest(TestCase):
             }
         )
         self.assertEqual(usd, 1000)  # only Neoxa counts: one venue
+
+
+    # Single-venue grace (BTCB2_SINGLE_VENUE_GRACE, default 3600 s).
+
+    ONE_VENUE_UP = {  # Neoxa down; NonKYC (both books) 20 % up
+        YADIO: YADIO_ANSWER,
+        NONKYC: nonkyc_book(1199, 1201),
+        NONKYC_BTC: nonkyc_book(0.01199, 0.01201),
+    }
+    DISAGREE_UP = {  # NonKYC 20 % up, Neoxa 50 % up: 25 % apart
+        YADIO: YADIO_ANSWER,
+        NONKYC: nonkyc_book(1199, 1201),
+        NEOXA: neoxa_book(1499, 1501),
+    }
+
+    def test_quorum_records_timestamp(self):
+        self.store_last(1000)
+        with patch("api.utils.time.time", return_value=5000.0):
+            self.rates(
+                {
+                    YADIO: YADIO_ANSWER,
+                    NONKYC: nonkyc_book(999, 1001),
+                    NEOXA: neoxa_book(1009, 1011),
+                }
+            )
+        self.assertEqual(cache.get(BTCB2_QUORUM_KEY), 5000.0)
+
+    def test_one_venue_within_grace_is_frozen(self):
+        self.store_last(1000)
+        cache.set(BTCB2_QUORUM_KEY, 10_000.0, None)
+        with patch("api.utils.time.time", return_value=10_000.0 + 3599):
+            usd, _ = self.rates(self.ONE_VENUE_UP)
+        self.assertEqual(usd, 1000)
+        self.assertEqual(cache.get(BTCB2_QUORUM_KEY), 10_000.0)  # not refreshed
+
+    def test_one_venue_after_grace_moves_at_most_one_step(self):
+        self.store_last(1000)
+        cache.set(BTCB2_QUORUM_KEY, 10_000.0, None)
+        with patch("api.utils.time.time", return_value=10_000.0 + 3601):
+            usd, _ = self.rates(self.ONE_VENUE_UP)
+        self.assertAlmostEqual(usd, 1050, places=6)  # 1200 capped at +5 %
+        self.assertEqual(cache.get(BTCB2_QUORUM_KEY), 10_000.0)  # still no quorum
+
+    def test_one_venue_after_grace_small_move_followed(self):
+        self.store_last(1000)
+        cache.set(BTCB2_QUORUM_KEY, 0.0, None)
+        with patch("api.utils.time.time", return_value=100_000.0):
+            usd, _ = self.rates({YADIO: YADIO_ANSWER, NEOXA: neoxa_book(979, 981)})
+        self.assertAlmostEqual(usd, 980, places=6)
+
+    def test_grace_is_configurable(self):
+        self.store_last(1000)
+        cache.set(BTCB2_QUORUM_KEY, 10_000.0, None)
+        with patch("api.utils.time.time", return_value=10_000.0 + 601):
+            usd, _ = self.rates(self.ONE_VENUE_UP, BTCB2_SINGLE_VENUE_GRACE=600)
+        self.assertAlmostEqual(usd, 1050, places=6)
+
+    def test_unknown_quorum_time_starts_grace_now(self):
+        # Redis lost the key: freeze and start counting from now.
+        self.store_last(1000)
+        with patch("api.utils.time.time", return_value=7777.0):
+            usd, _ = self.rates(self.ONE_VENUE_UP)
+        self.assertEqual(usd, 1000)
+        self.assertEqual(cache.get(BTCB2_QUORUM_KEY), 7777.0)
+
+    def test_disagreement_within_grace_is_frozen(self):
+        self.store_last(1000)
+        cache.set(BTCB2_QUORUM_KEY, 10_000.0, None)
+        with patch("api.utils.time.time", return_value=10_000.0 + 1800):
+            usd, _ = self.rates(self.DISAGREE_UP)
+        self.assertEqual(usd, 1000)
+
+    def test_disagreement_after_grace_closest_venue_one_step(self):
+        self.store_last(1000)
+        cache.set(BTCB2_QUORUM_KEY, 10_000.0, None)
+        with patch("api.utils.time.time", return_value=10_000.0 + 3601):
+            usd, _ = self.rates(self.DISAGREE_UP)
+        self.assertAlmostEqual(usd, 1050, places=6)
+        # Closest venue (NonKYC, 1000 x 0.97 = 970 vs Neoxa 1300) when inside the step.
+        self.store_last(1000)
+        with patch("api.utils.time.time", return_value=10_000.0 + 3700):
+            usd, _ = self.rates(
+                {
+                    YADIO: YADIO_ANSWER,
+                    NONKYC: nonkyc_book(969, 971),
+                    NEOXA: neoxa_book(1299, 1301),
+                }
+            )
+        self.assertAlmostEqual(usd, 970, places=6)
+
+    def test_no_venue_keeps_last_price(self):
+        self.store_last(1000)
+        usd, _ = self.rates({YADIO: YADIO_ANSWER}, BTCB2_FALLBACK_USD=500.0)
+        self.assertEqual(usd, 1000)
+
+    def test_no_venue_first_start_uses_fallback(self):
+        Currency.objects.filter(currency=self.usd).delete()
+        usd, _ = self.rates({YADIO: YADIO_ANSWER}, BTCB2_FALLBACK_USD=500.0)
+        self.assertEqual(usd, 500.0)
 
 
 class NeoxaRatesTest(TestCase):

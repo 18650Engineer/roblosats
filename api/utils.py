@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
 
@@ -233,6 +234,31 @@ def neoxa_rates(session, api_url, currencies):
     return rates
 
 
+# When the BTCB2 price last had venue quorum (unix time), for BTCB2_SINGLE_VENUE_GRACE.
+# In the Django cache (Redis, no expiry): survives restarts of the app; if Redis loses it,
+# the grace period simply starts again.
+BTCB2_QUORUM_KEY = "roblosats:btcb2_quorum_at"
+
+
+def _get_quorum_at():
+    try:
+        from django.core.cache import cache
+
+        v = cache.get(BTCB2_QUORUM_KEY)
+        return float(v) if v is not None else None
+    except Exception as e:
+        print(f"Could not read {BTCB2_QUORUM_KEY}: {str(e)}")
+        return None
+
+
+def _set_quorum_at(t):
+    try:
+        from django.core.cache import cache
+
+        cache.set(BTCB2_QUORUM_KEY, t, None)
+    except Exception as e:
+        print(f"Could not store {BTCB2_QUORUM_KEY}: {str(e)}")
+
 
 def nonkyc_rates(session, api_url, currencies):
     """
@@ -245,11 +271,13 @@ def nonkyc_rates(session, api_url, currencies):
     Every quote is the MIDPOINT of the order book (bid/ask), never the last trade, and only
     if the spread is sane (BTCB2_MAX_SPREAD). NonKYC is one venue (the mean of its BTCB2/USDT
     and BTCB2/BTC x BTC/USD books); Neoxa (NEOXA_TICKER_URL) is the other. The price is the
-    mean of the venues; if they disagree by more than BTCB2_MAX_VENUE_DEVIATION, the one
-    closer to the last stored price wins. It never moves more than BTCB2_MAX_STEP from the
-    last stored price per refresh. With fewer than BTCB2_MIN_VENUES (2) venues answering,
-    the last stored price is kept. Other fiat currencies are
-    that USD price times yadio's USD rate for them, as before.
+    mean of the venues (they must agree within BTCB2_MAX_VENUE_DEVIATION). It never moves
+    more than BTCB2_MAX_STEP from the last stored price per refresh. With fewer than BTCB2_MIN_VENUES (2) venues answering, or
+    two that disagree, the last stored price is kept for BTCB2_SINGLE_VENUE_GRACE seconds
+    (1 h) from the last refresh with quorum; after that the closest remaining venue is
+    followed, still capped by BTCB2_MAX_STEP. No venue at all keeps the last stored price
+    (BTCB2_FALLBACK_USD on first start). Other fiat currencies are that USD price times
+    yadio's USD rate for them, as before.
 
     Trust: the default proxies (mempool.kilombino.com) are run by Roblosats' maintainer.
     A coordinator with clearnet access can point straight at the venues instead
@@ -318,40 +346,61 @@ def nonkyc_rates(session, api_url, currencies):
         last = float(Currency.objects.get(currency=usd_code).exchange_rate)
     except Exception as e:
         print(f"No stored BTCB2 USD price to compare with: {str(e)}")
-    # With fewer than BTCB2_MIN_VENUES distinct venues answering, one venue alone could
-    # walk the price (BTCB2_MAX_STEP per refresh, again and again): keep the last stored
-    # price instead. Only when there is none yet (first start) is one venue enough.
+    # Quorum: at least BTCB2_MIN_VENUES (2) distinct venues answering and, with two, agreeing
+    # within BTCB2_MAX_VENUE_DEVIATION. Without quorum the last stored price is kept, but
+    # only for BTCB2_SINGLE_VENUE_GRACE seconds (1 h) counted from the last refresh that had
+    # quorum: after that the closest remaining venue is followed again, still capped by
+    # BTCB2_MAX_STEP per refresh. (One venue alone could otherwise walk the price at will;
+    # a frozen price forever is wrong too when a venue is gone for good.)
     min_venues = config("BTCB2_MIN_VENUES", cast=int, default=2)
-    if venues and len(venues) < min_venues and last and last > 0:
-        print(
-            f"Only {len(venues)} BTCB2 venue(s) answered (BTCB2_MIN_VENUES={min_venues}); "
-            f"keeping the last price {last:.2f}"
-        )
-        venues = []
-        usd = last
+    grace = config("BTCB2_SINGLE_VENUE_GRACE", cast=int, default=3600)
+    max_dev = config("BTCB2_MAX_VENUE_DEVIATION", cast=float, default=0.10)
+    disagree = len(venues) == 2 and abs(venues[0] - venues[1]) / min(venues) > max_dev
+    if disagree:
+        print(f"BTCB2 venues disagree (NonKYC {venues[0]:.2f}, Neoxa {venues[1]:.2f})")
+    has_last = bool(last and last > 0)
+    now = time.time()
+
+    def closest():
+        return min(venues, key=lambda v: abs(v - last)) if has_last else min(venues)
+
+    if venues and len(venues) >= min_venues and not (disagree and min_venues >= 2):
+        usd = closest() if disagree else float(np.mean(venues))
+        _set_quorum_at(now)
+    elif venues and not has_last:
+        # First start: nothing stored yet, so one venue (or the lower one) is enough.
+        usd = closest()
     elif venues:
-        usd = float(np.mean(venues))
-        if len(venues) == 2:
-            a, b = venues
-            if abs(a - b) / min(a, b) > config("BTCB2_MAX_VENUE_DEVIATION", cast=float, default=0.10):
-                # The venues disagree: one of them is off (thin book, manipulation).
-                # Then they are not two agreeing venues: keep the last stored price
-                # if BTCB2_MIN_VENUES asks for two, else the venue closer to it.
-                if min_venues >= 2 and last and last > 0:
-                    usd = last
-                else:
-                    usd = min(venues, key=lambda v: abs(v - last)) if last else min(venues)
-                print(f"BTCB2 venues disagree (NonKYC {a:.2f}, Neoxa {b:.2f}); using {usd:.2f}")
-        # And never move more than BTCB2_MAX_STEP per refresh: a real move gets there in a
-        # few minutes, a one-off spike or a thin-book trick doesn't.
-        step = config("BTCB2_MAX_STEP", cast=float, default=0.05)
-        if last and last > 0:
-            usd = min(max(usd, last * (1 - step)), last * (1 + step))
+        since = _get_quorum_at()
+        if since is None:
+            # Unknown (cache emptied): start the grace period now, the safe side.
+            since = now
+            _set_quorum_at(now)
+        if now - since < grace:
+            usd = last
+            print(
+                f"{len(venues)} BTCB2 venue(s) usable (BTCB2_MIN_VENUES={min_venues}); keeping "
+                f"the last price {last:.2f} ({int(now - since)} s of {grace} s without quorum)"
+            )
+        else:
+            usd = closest()
+            print(
+                f"No BTCB2 venue quorum for {int(now - since)} s (> {grace} s); following "
+                f"{usd:.2f}, at most BTCB2_MAX_STEP per refresh"
+            )
+    elif has_last:
+        usd = last
+        print(f"No BTCB2 quote; keeping the last price {last:.2f}")
     else:
         usd = config("BTCB2_FALLBACK_USD", cast=float, default=0.0)
         if not usd > 0:
             raise Exception("no BTCB2 price from NonKYC or Neoxa")
         print(f"No BTCB2 quote; using BTCB2_FALLBACK_USD={usd}")
+    # And never move more than BTCB2_MAX_STEP per refresh: a real move gets there in a few
+    # minutes, a one-off spike or a thin-book trick doesn't.
+    if has_last:
+        step = config("BTCB2_MAX_STEP", cast=float, default=0.05)
+        usd = min(max(usd, last * (1 - step)), last * (1 + step))
 
     rates = []
     for currency in currencies:

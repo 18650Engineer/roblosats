@@ -20,10 +20,16 @@ release tag, so each new RoboSats release can be taken by rebasing that branch.
 - **Prices** (`api/utils.py`, `nonkyc_rates`): BTCB2 in USD from two venues, NonKYC (its
   BTCB2/USDT and BTCB2/BTC x BTC/USD books count as one venue) and Neoxa. Every quote is the
   order-book midpoint with a spread of at most 5 % (`BTCB2_MAX_SPREAD`), never the last trade.
-  The price is the mean of the two venues; with fewer than `BTCB2_MIN_VENUES` (2) answering,
-  or if they differ by more than `BTCB2_MAX_VENUE_DEVIATION` (10 %), the last stored price is
-  kept; it never moves more than `BTCB2_MAX_STEP` (5 %) per refresh. Every other fiat currency
-  is that price times yadio's USD rate. Set
+  The price is the mean of the two venues, and it never moves more than `BTCB2_MAX_STEP`
+  (5 %) per refresh. With fewer than `BTCB2_MIN_VENUES` (2) answering, or if they differ by
+  more than `BTCB2_MAX_VENUE_DEVIATION` (10 %), the last stored price is kept for
+  `BTCB2_SINGLE_VENUE_GRACE` seconds (3600), counted from the last refresh that had both
+  venues agreeing; after that the remaining venue (or, if they still disagree, the one closer
+  to the stored price) is followed again, still at most 5 % per refresh. The time of that
+  last good refresh is kept in Redis (`roblosats:btcb2_quorum_at`); if Redis loses it, the
+  hour starts again. With no venue at all the stored price is kept (`BTCB2_FALLBACK_USD` only
+  on a first start with nothing stored). Every other fiat currency is that price times
+  yadio's USD rate. Set
 
   ```
   MARKET_PRICE_APIS = 'https://mempool.kilombino.com/nonkyc-ticker'
