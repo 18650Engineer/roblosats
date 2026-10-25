@@ -4,7 +4,7 @@ match: "roblosats-v\\d+\\.\\d+\\.\\d+.*-arm64-v8a\\.apk"
 name: Roblosats
 summary: A simple and private bitcoin exchange, on the BLAKE2b chain
 description: |
-  Roblosats is a simple and private app to exchange bitcoin on the BLAKE2b chain (BTC/XBT) for national currencies, peer to peer, over its Lightning network. It is a fork of RoboSats: same robots, same hold-invoice escrow, same privacy, on the BLAKE2b chain.
+  Roblosats is a simple and private app to exchange bitcoin on the BLAKE2b chain (BTC) for national currencies, peer to peer, over its Lightning network. It is a fork of RoboSats: same robots, same hold-invoice escrow, same privacy, on the BLAKE2b chain.
   Features:
   - Privacy focused: your robot avatar is generated from a token, no registration, no KYC.
   - Built-in Tor: the app reaches the coordinators through their onion addresses.
