@@ -52,7 +52,9 @@ release tag, so each new RoboSats release can be taken by rebasing that branch.
   any other database.
 - **Fee rates** for on-chain payouts come from the chain's own mempool (`MEMPOOL_FEES_URL`,
   default https://mempool.kilombino.com), not mempool.space.
-- **No devfund keysend** when `DEVFUND=0` (RoboSats' devfund node is not on this Lightning network).
+- **Devfund**: the `DEVFUND` fraction of each successful order's proceeds goes by keysend to the
+  Roblosats maintainer's node (`devfund_pubkey.json` in this branch), which keeps Roblosats and its
+  security fixes going. It is optional: `DEVFUND=0` sends nothing.
 - **Trade limits** (`MIN_TRADE`, `MAX_TRADE`) come from the environment: a sat of this chain is
   worth about 1/100 of one on the SHA-256 chain, so the same fiat amounts need more sats.
 - **Federation**: its own, starting with Kilobot only; no third-party platforms or lnproxies

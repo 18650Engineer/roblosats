@@ -145,12 +145,13 @@ devfund_pubkey = {}
 def get_devfund_pubkey(network: str) -> str:
     """
     network: (str) "mainnet" | "testnet";
-    Fetches devfund pubkey from `main` branch in the repository
+    Fetches devfund pubkey from the `roblosats` branch of Kilombino/roblosats
+    (the Roblosats maintainer's node on the BLAKE2b Lightning network),
     fallback to hardcoded pubkey
     """
 
     session = get_session()
-    url = "https://raw.githubusercontent.com/RoboSats/robosats/main/devfund_pubkey.json"
+    url = "https://raw.githubusercontent.com/Kilombino/roblosats/roblosats/devfund_pubkey.json"
 
     try:
         response = session.get(url)

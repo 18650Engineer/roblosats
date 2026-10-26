@@ -135,7 +135,7 @@ def follow_send_payment(hash):
 @shared_task(name="send_devfund_donation", time_limit=300, soft_time_limit=295)
 def send_devfund_donation(order_id, proceeds, reason):
     """Sends a fraction of order.proceeds via keysend as
-    donation to the RoboSats Open Source project devfund.
+    donation to the Roblosats devfund (its maintainer's node; see devfund_pubkey.json).
     """
     from decouple import config
     from django.contrib.auth.models import User
@@ -147,8 +147,7 @@ def send_devfund_donation(order_id, proceeds, reason):
     order = Order.objects.get(id=order_id)
     coordinator_alias = config("COORDINATOR_ALIAS", cast=str, default="NoAlias")
     donation_fraction = min(1.0, max(0.00, config("DEVFUND", cast=float, default=0.2)))
-    # Roblosats: with no devfund there is nothing to send (RoboSats' devfund node is not on
-    # this chain's Lightning network anyway).
+    # Roblosats: with no devfund there is nothing to send.
     if donation_fraction <= 0:
         return False
     target_pubkey = get_devfund_pubkey(config("NETWORK", cast=str))
